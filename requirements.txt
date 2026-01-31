@@ -1,13 +1,14 @@
 absl-py==2.3.1
 appnope==0.1.4
 asttokens==3.0.1
+colorlog==6.10.1
 comm==0.2.3
 contourpy==1.3.3
-# Editable Git install with no remote (cpwllib==0.0.1)
--e /Users/marisusis/Documents/ANL/cpwl
+-e git+ssh://git@github.com/quentinplsrd/cpwl_approximation_of_xy.git@655f4d51ca6c3719ab692dba992be83dc5f08bc8#egg=cpwllib
 cycler==0.12.1
 debugpy==1.8.19
 decorator==5.2.1
+et_xmlfile==2.0.0
 executing==2.2.1
 fonttools==4.61.1
 immutabledict==4.2.2
@@ -22,6 +23,7 @@ matplotlib==3.10.8
 matplotlib-inline==0.2.1
 nest-asyncio==1.6.0
 numpy==2.4.0
+openpyxl==3.1.5
 ortools==9.14.6206
 packaging==25.0
 pandas==2.3.3
@@ -47,7 +49,9 @@ seaborn==0.13.2
 six==1.17.0
 stack-data==0.6.3
 tornado==6.5.4
+tqdm==4.67.1
 traitlets==5.14.3
 typing_extensions==4.15.0
 tzdata==2025.3
 wcwidth==0.2.14
+xlsxwriter==3.2.9

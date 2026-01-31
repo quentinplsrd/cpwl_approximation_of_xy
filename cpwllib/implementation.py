@@ -263,6 +263,7 @@ def plot_faces_3d(faces):
     else:
         faceCollection = Poly3DCollection(faces,shade=False,facecolors='C1',edgecolors='k',alpha=0.5)
         ax.add_collection3d(faceCollection)
+    return fig
 
 def plot_faces_2d(faces):
     fig = plt.figure()
@@ -290,11 +291,160 @@ def plot_faces_2d(faces):
 #                                       logarithmic_encoding= [True/False])
 
 
+def do_product_linearization(
+    model: mathopt.Model,
+    partition_method: str,
+    N: int,
+    X_var,
+    Y_var,
+    Z_var,
+    quadratic: bool = False,
+    logarithmic_encoding: bool = True
+):
+    # logger.info(f"Performing {partition_method} product linearization for variables: "
+                # f"{X_var.name}, {Y_var.name}, {Z_var.name}")
+    
+    if quadratic:
+        print('Make sure to use SCIP or Gurobi as the solver for quadratic constraints')
+        model.add_quadratic_constraint(
+            (0.0 <= x * y - z) <= 0.0,
+            name=f"z_is_xy({Z_var.name})"
+        )
+        variables = {
+            'X': X_var, 'Y': Y_var, 'Z': Z_var,
+            'x': x, 'y': y, 'z': z
+        }
+        return variables
+    
+    if partition_method not in ['triangles','polygons','sum of convex']:
+        raise ValueError(f"Invalid method: {partition_method}. "
+                         "Supported methods are 'triangles', 'polygons', and 'sum of convex'.")
+    
+    x = model.add_variable(
+        name=f"{X_var.name}_aux",
+        lb=0.0,
+        ub=1.0,
+    )
+
+    y = model.add_variable(
+        name=f"{Y_var.name}_aux",
+        lb=0.0,
+        ub=1.0
+    )
+
+    z = model.add_variable(
+        name=f"{Z_var.name}_aux",
+        lb=0.0,
+        ub=1.0
+    )
+
+    z_c = []
+    xx = []
+    yy = []
+    zz = []
+    bv = []
+    gv = []
+
+    X_min = X_var.lower_bound
+    X_max = X_var.upper_bound
+    Y_min = Y_var.lower_bound
+    Y_max = Y_var.upper_bound
+
+    model.add_linear_constraint(
+        X_var == X_min + (X_max - X_min) * x,
+        name = f"X_{Z_var.name}_normalization",
+    )
+
+    model.add_linear_constraint(
+        Y_var == Y_min + (Y_max - Y_min) * y,
+        name = f"Y_{Z_var.name}_normalization",
+    )
+
+    model.add_linear_constraint(
+        Z_var == X_min * Y_min + Y_min * (X_max - X_min) * x +
+                X_min * (Y_max - Y_min) * y + (Y_max - Y_min) * (X_max - X_min) * z,
+        name=f"Z_{Z_var.name}_normalization"
+    )
+    
+    if partition_method in ['triangles','polygons']:
+        N_C = 1
+        # get polygons/triangles faces
+        faces = list_faces_from_N(N, method=partition_method)
+        # get linear coeffs and region inequalities
+        list_coeffs, list_equations = equations_from_faces_3d(faces)
+        COEFFS = [list_coeffs]
+        EQUATIONS = [list_equations]
+    else:
+        N_C = 2
+        # get linear coeffs and region inequalities
+        list_coeffs_j, list_equations_j, list_coeffs_k, list_equations_k = equations_sum_convex(N)
+        COEFFS = [list_coeffs_j, list_coeffs_k]
+        EQUATIONS = [list_equations_j, list_equations_k]
+
+    z_c = [model.add_variable(name=f"z_c({Z_var.name},{cc})") for cc in range(N_C)]
+    # z = zc_1 + zc_2
+    model.add_linear_constraint(z == sum(z_c), name=f"sum_convex({X_var.name},{Y_var.name})")
+
+    for cc in range(N_C):
+        coeffs_ = list(COEFFS[cc])
+        equations_ = list(EQUATIONS[cc])
+
+        # number of regions
+        NN = len(equations_)
+
+        # define regional components of x, y, z
+        xx_c = [model.add_variable(name=f"xx_{X_var.name}_{cc}_{i}", lb=0.0, ub=1.0) for i in range(NN)]
+        yy_c = [model.add_variable(name=f"yy_{Y_var.name}_{cc}_{i}", lb=0.0, ub=1.0) for i in range(NN)]
+        zz_c = [model.add_variable(name=f"zz_{Z_var.name}_{cc}_{i}") for i in range(NN)]
+        # binary variable indicating which region is active
+        if logarithmic_encoding:
+            bv_c = [model.add_variable(name=f"bv_{Z_var.name}_{cc}_{i}", lb=0.0, ub=1.0) for i in range(NN)]
+            gv_c = [model.add_binary_variable(name=f"gv_{Z_var.name}_{cc}_{q}") for q in range(P)]
+        else:
+            bv_c = [model.add_binary_variable(name=f"bv_{Z_var.name}_{cc}_{i}") for i in range(NN)]
+
+        # append the regional variables to the overall lists
+        xx.append(xx_c)
+        yy.append(yy_c)
+        zz.append(zz_c)
+        bv.append(bv_c)
+        
+        if logarithmic_encoding:
+            gv.append(gv_c)
+
+        # x, y, z are equal to the sum of their components
+        model.add_linear_constraint(x == sum(xx_c), name=f"sum_xx_{Z_var.name}_{cc}")
+        model.add_linear_constraint(y == sum(yy_c), name=f"sum_yy_{Z_var.name}_{cc}")
+        model.add_linear_constraint(z_c[cc] == sum(zz_c), name=f"sum_zz_{Z_var.name}_{cc}")
+        # only one region can be active at a time
+        model.add_linear_constraint(sum(bv_c) == 1.0, name=f"sum_bv_{Z_var.name}_{cc}")
+
+        for i in range(NN):
+            a, b, c = coeffs_[i]
+            # relationship between x, y, z on a given region
+            model.add_linear_constraint(zz_c[i] == a * xx_c[i] + b * yy_c[i] + c * bv_c[i],
+                                          name=f"rel_{Z_var.name}_{cc}_{i}")
+            # if a region is not active, the coordinates of the component are forced to 0
+            model.add_linear_constraint(xx_c[i] <= bv_c[i], name=f"xx_bound_{Z_var.name}_{cc}_{i}")
+            model.add_linear_constraint(yy_c[i] <= bv_c[i], name=f"yy_bound_{Z_var.name}_{cc}_{i}")
+            for j in range(len(equations_[i])):
+                aa, bb, cc_coef = equations_[i][j]
+                # inequalities defining the region
+                model.add_linear_constraint(aa * xx_c[i] + bb * yy_c[i] + cc_coef * bv_c[i] <= 0.0,
+                                              name=f"ineq_{Z_var.name}_{cc}_{i}_{j}")
+
+    variables = {
+        'X': X_var, 'Y': Y_var, 'Z': Z_var,
+        'x': x, 'y': y, 'z': z,
+        'xx': xx, 'yy': yy, 'zz': zz,
+        'z_c': z_c, 'bv': bv
+    }
+
 def MILP_or_QP_variables_and_constraints(model, X, Y, 
                                          quadratic=False,
                                          target_error=0.01,
                                          partition_method='triangles',
-                                         logarithmic_encoding=True):
+                                         logarithmic_encoding=True):    
     
     # if quadratic: uses the real constraint Z = X*Y
     # make sure the solver is SCIP or Gurobi
@@ -314,159 +464,54 @@ def MILP_or_QP_variables_and_constraints(model, X, Y,
     N_nodes = len(X)
     N_time = len(X[0])
     
-    # # initial variables for Z = X*Y (Q and T)
-    # X = model.add_variable(name="X")
-    # Y = model.add_variable(name="Y")
+    # Create Z variables
     Z = [[model.add_variable(name=f"Z({p},{t})") 
           for t in range(N_time)] for p in range(N_nodes)]
-
     
     # Resolution level
     N = N_from_target_error(target_error)
     
+    # Initialize variable dictionaries for aggregation
+    all_vars = {
+        'X': X, 'Y': Y, 'Z': Z,
+        'x': [[None for t in range(N_time)] for p in range(N_nodes)],
+        'y': [[None for t in range(N_time)] for p in range(N_nodes)],
+        'z': [[None for t in range(N_time)] for p in range(N_nodes)]
+    }
     
-    # rescaled variables
-    x = [[model.add_variable(name=f"x({p},{t})", lb=0., ub=1.)
-          for t in range(N_time)] for p in range(N_nodes)]
-    y = [[model.add_variable(name=f"y({p},{t})", lb=0., ub=1.)
-          for t in range(N_time)] for p in range(N_nodes)]
-    z = [[model.add_variable(name=f"z({p},{t})", lb=0., ub=1.)
-          for t in range(N_time)] for p in range(N_nodes)]
+    if not quadratic:
+        all_vars['xx'] = [[[] for t in range(N_time)] for p in range(N_nodes)]
+        all_vars['yy'] = [[[] for t in range(N_time)] for p in range(N_nodes)]
+        all_vars['zz'] = [[[] for t in range(N_time)] for p in range(N_nodes)]
+        all_vars['z_c'] = [[[] for t in range(N_time)] for p in range(N_nodes)]
+        all_vars['bv'] = [[[] for t in range(N_time)] for p in range(N_nodes)]
+        all_vars['gv'] = [[[] for t in range(N_time)] for p in range(N_nodes)]
     
-    if quadratic:
-        
-        print('Make sure to use SCIP or Gurobi as the solver for quadratic constraints')
-        
-    else:
-    
-        z_c = [[[] for t in range(N_time)] for p in range(N_nodes)]
-        
-        xx = [[[] for t in range(N_time)] for p in range(N_nodes)]
-        yy = [[[] for t in range(N_time)] for p in range(N_nodes)]
-        zz = [[[] for t in range(N_time)] for p in range(N_nodes)]
-        bv = [[[] for t in range(N_time)] for p in range(N_nodes)]
-        gv = [[[] for t in range(N_time)] for p in range(N_nodes)]
-        
-        if partition_method in ['triangles','polygons']:
-            N_C = 1
-            # get polygons/triangles faces
-            faces = list_faces_from_N(N, method=partition_method)
-            # get linear coeffs and region inequalities
-            list_coeffs, list_equations = equations_from_faces_3d(faces)
-            COEFFS = [list_coeffs]
-            EQUATIONS = [list_equations]
-        else:
-            N_C = 2
-            # get linear coeffs and region inequalities
-            list_coeffs_j, list_equations_j, list_coeffs_k, list_equations_k = equations_sum_convex(N)
-            COEFFS = [list_coeffs_j, list_coeffs_k]
-            EQUATIONS = [list_equations_j, list_equations_k]
-
+    # Apply product linearization for each (p, t) pair
     for p in range(N_nodes):
         for t in range(N_time):
+            vars_pt = do_product_linearization(
+                model=model,
+                partition_method=partition_method,
+                N=N,
+                X_var=X[p][t],
+                Y_var=Y[p][t],
+                Z_var=Z[p][t],
+                quadratic=quadratic,
+                logarithmic_encoding=logarithmic_encoding
+            )
             
-            X_min = X[p][t].lower_bound
-            X_max = X[p][t].upper_bound
-            Y_min = Y[p][t].lower_bound
-            Y_max = Y[p][t].upper_bound
-
-            # link between initial and rescaled variables
-            model.add_linear_constraint(X[p][t] == X_min + (X_max-X_min)*x[p][t], name=f"X_to_x({p},{t})")
-            model.add_linear_constraint(Y[p][t] == Y_min + (Y_max-Y_min)*y[p][t], name=f"Y_to_y({p},{t})")
-            model.add_linear_constraint(Z[p][t] == X_min*Y_min + Y_min*(X_max-X_min)*x[p][t]
-                                        + X_min*(Y_max-Y_min)*y[p][t] + (Y_max-Y_min)*(X_max-X_min)*z[p][t], name=f"Z_to_z({p},{t})")
+            # Aggregate variables
+            all_vars['x'][p][t] = vars_pt['x']
+            all_vars['y'][p][t] = vars_pt['y']
+            all_vars['z'][p][t] = vars_pt['z']
             
-            
-            if quadratic:
-                
-                model.add_quadratic_constraint((0.0 <= x[p][t]*y[p][t] - z[p][t]) <= 0.0, name=f"z_is_xy({p},{t})")
-            
-            else:
-                      
-                # z_c = [model.add_variable(name=f"z_c({cc})") for cc in range(N_C)]
-                z_c[p][t] = [model.add_variable(name=f"z_c({p},{t},{cc})") for cc in range(N_C)]
-                # z = zc_1 + zc_2
-                model.add_linear_constraint(z[p][t] == sum(z_c[p][t]), name=f"sum_convex({p},{t})")  
-            
-                # xx = []
-                # yy = []
-                # zz = []
-                # bv = []
-            
-                for cc in range(N_C):
-                    coeffs = list(COEFFS[cc])
-                    equations = list(EQUATIONS[cc])
-            
-                    # number of regions
-                    NN = len(equations)
-                    # P = np.ceil(np.log2(NN)).astype(int)
-                    P = (NN-1).bit_length()
-                    
-                    # define regional components of x, y, z
-                    xx_c = [model.add_variable(name=f"xx({p},{t},{cc},{i})", lb=0., ub=1.) for i in range(NN)]
-                    yy_c = [model.add_variable(name=f"yy({p},{t},{cc},{i})", lb=0., ub=1.) for i in range(NN)]
-                    zz_c = [model.add_variable(name=f"zz({p},{t},{cc},{i})") for i in range(NN)]
-                    # binary variable indicating which region is active
-                    if logarithmic_encoding:
-                        bv_c =  [model.add_variable(name=f"bv({p},{t},{cc},{i})", lb=0., ub=1.) for i in range(NN)]
-                        gv_c =  [model.add_binary_variable(name=f"gv({p},{t},{cc},{q})") for q in range(P)]
-                    else:
-                        bv_c =  [model.add_binary_variable(name=f"bv({p},{t},{cc},{i})") for i in range(NN)]
-                
-                    xx[p][t].append(xx_c)
-                    yy[p][t].append(yy_c)
-                    zz[p][t].append(zz_c)
-                    bv[p][t].append(bv_c)
-                    
-                    if logarithmic_encoding:
-                        gv[p][t].append(gv_c)
-                    
-                    # x, y, z are equal to the sum of their components
-                    model.add_linear_constraint(x[p][t] == sum(xx_c), name=f"sum_xx({p},{t},{cc})")
-                    model.add_linear_constraint(y[p][t] == sum(yy_c), name=f"sum_yy({p},{t},{cc})")
-                    model.add_linear_constraint(z_c[p][t][cc] == sum(zz_c), name=f"sum_zz({p},{t},{cc})")
-                    # only one region can be active at a time
-                    model.add_linear_constraint(sum(bv_c) == 1., name=f"sum_bv({p},{t},{cc})")
-                    
-                    if logarithmic_encoding:
-                        binary_array = np.array([binary_rep(i,NN) for i in range(NN)])
-                        for q in range(P):
-                            model.add_linear_constraint(
-                                sum([bv_c[i] for i in range(NN) if binary_array[i,q]==1]) <= gv_c[q],
-                                name=f"gv_lb({p},{t},{cc},{q})")
-                            model.add_linear_constraint(
-                                sum([bv_c[i] for i in range(NN) if binary_array[i,q]==0]) <= 1 - gv_c[q],
-                                name=f"gv_ub({p},{t},{cc},{q})")
-                        # Previous, inefficient constraints    
-                        # for i in range(NN):
-                        #     bin_rep = binary_rep(i,NN)
-                        #     model.add_linear_constraint(
-                        #         bv_c[i] >= 1 - P + 
-                        #         sum([bin_rep[q]*gv_c[q] + (1-bin_rep[q])*(1 - gv_c[q]) for q in range(P)]), 
-                        #         name=f"bv_lb({p},{t},{cc},{i})")
-                        #     for q in range(P):
-                        #         model.add_linear_constraint(bv_c[i] <= bin_rep[q]*gv_c[q] + (1-bin_rep[q])*(1 - gv_c[q]), name=f"bv_ub({p},{t},{cc},{i},{q})")
-            
-                    for i in range(NN):
-                        a, b, c = coeffs[i]
-                        # relationship between x,y,z on a given region
-                        model.add_linear_constraint(zz_c[i] == a*xx_c[i] + b*yy_c[i] + c*bv_c[i])
-                        # if a region is not active, the coordinates of the component is (0,0)
-                        model.add_linear_constraint(xx_c[i] <= bv_c[i])
-                        model.add_linear_constraint(yy_c[i] <= bv_c[i])
-                        for j in range(len(equations[i])):
-                            aa, bb, cc = equations[i][j]
-                            # inequalities defining the region
-                            model.add_linear_constraint(aa*xx_c[i] + bb*yy_c[i] + cc*bv_c[i] <= 0.)
-
-    if quadratic:
-        variables = {'X': X, 'Y': Y, 'Z': Z,
-                     'x': x, 'y': y, 'z': z}
-    else:         
-        variables = {'X': X, 'Y': Y, 'Z': Z,
-                     'x': x, 'y': y, 'z': z,
-                     'xx': xx, 'yy': yy, 'zz': zz,
-                     'z_c': z_c, 'bv': bv, 'gv': gv}
+            if not quadratic:
+                all_vars['xx'][p][t] = vars_pt['xx']
+                all_vars['yy'][p][t] = vars_pt['yy']
+                all_vars['zz'][p][t] = vars_pt['zz']
+                all_vars['z_c'][p][t] = vars_pt['z_c']
+                all_vars['bv'][p][t] = vars_pt['bv']
+                all_vars['gv'][p][t] = vars_pt['gv']
     
-    return variables
-    
+    return all_vars
