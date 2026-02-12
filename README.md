@@ -3,6 +3,16 @@
 
 ## Setup
 
+### With `pip`
+```
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+pip install -e .
+```
+
+### With `uv`
+
 ```
 uv venv
 source .venv/bin/activate
